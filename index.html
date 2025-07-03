@@ -203,6 +203,10 @@
             transform: scale(1.02);
         }
 
+        .employee-card.updating {
+            opacity: 0.8;
+        }
+
         .employee-name {
             font-size: 1.1em;
             font-weight: bold;
@@ -225,6 +229,7 @@
             border-radius: 6px;
             border: 1px solid #e9ecef;
             transition: all 0.2s ease;
+            position: relative;
         }
 
         @media (min-width: 576px) { .checklist-item { padding: 10px; border-radius: 8px; } }
@@ -232,6 +237,31 @@
         .checklist-item:hover {
             border-color: #ff6b35;
             background: white;
+        }
+
+        .checklist-item.pending {
+            background: #fff3cd;
+            border-color: #ffeaa7;
+        }
+
+        .checklist-item.pending::after {
+            content: "⏳";
+            position: absolute;
+            right: 8px;
+            font-size: 0.8em;
+            animation: pulse 1.5s infinite;
+        }
+
+        .checklist-item.error {
+            background: #f8d7da;
+            border-color: #f5c6cb;
+        }
+
+        .checklist-item.error::after {
+            content: "⚠️";
+            position: absolute;
+            right: 8px;
+            font-size: 0.8em;
         }
 
         .checklist-item input[type="checkbox"] {
@@ -244,6 +274,11 @@
 
         @media (min-width: 576px) {
             .checklist-item input[type="checkbox"] { width: 18px; height: 18px; margin-right: 12px; }
+        }
+
+        .checklist-item input[type="checkbox"]:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
         }
 
         .checklist-item label {
@@ -264,6 +299,11 @@
         .checklist-item.completed label {
             text-decoration: line-through;
             color: #6c757d;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
         }
 
         .summary-stats {
@@ -661,14 +701,14 @@
 
     <script>
         // Firebase Configuration
- const firebaseConfig = {
-  apiKey: "AIzaSyBZm7QPguwRiGKqgckSo2QACO51wj0Lv5U",
-  authDomain: "amal-yaumi-fix.firebaseapp.com",
-  projectId: "amal-yaumi-fix",
-  storageBucket: "amal-yaumi-fix.firebasestorage.app",
-  messagingSenderId: "115069708327",
-  appId: "1:115069708327:web:e48e46215a1404afb3c602"
-};
+        const firebaseConfig = {
+            apiKey: "AIzaSyDdCvdJrthzS07BkAQagNAadWvV3PcNnDk",
+            authDomain: "amall-yaumi.firebaseapp.com",
+            projectId: "amall-yaumi",
+            storageBucket: "amall-yaumi.firebasestorage.app",
+            messagingSenderId: "743065908741",
+            appId: "1:743065908741:web:5551c8cdb47a3edac58e6c"
+        };
 
         // Application Data
         let employees = [
@@ -688,20 +728,26 @@
             'Istighfar & sholawat'
         ];
 
-        // Admin Variables
-        let currentUser = null;
-        let adminEmployees = [...employees];
-        let adminTasks = [...checklistItems];
-
         // Global variables
         let checklistData = {};
         let unsubscribe = null;
         let isFirebaseConnected = false;
-        let lastResetCheck = null;
-
-        // Edit mode tracking
+        let connectionRetryCount = 0;
+        let maxRetryAttempts = 5;
+        let isOnline = navigator.onLine;
+        let currentUser = null;
+        let adminEmployees = [...employees];
+        let adminTasks = [...checklistItems];
         let editingEmployee = null;
         let editingTask = null;
+        let lastResetCheck = null;
+
+        // Enhanced tracking variables
+        let pendingUpdates = new Map();
+        let updateDebounceTimers = new Map();
+        let connectionMonitor = null;
+        let lastHeartbeat = Date.now();
+        let heartbeatInterval = null;
 
         // Utility Functions
         function getTodayKey() {
@@ -804,6 +850,323 @@
             }
         }
 
+        // Enhanced Connection Monitoring
+        function setupConnectionMonitoring() {
+            window.addEventListener('online', () => {
+                isOnline = true;
+                console.log('🌐 Connection restored');
+                updateStatusInfo('🟢 Koneksi pulih - mencoba sinkronisasi');
+                reconnectFirebase();
+            });
+
+            window.addEventListener('offline', () => {
+                isOnline = false;
+                console.log('📴 Connection lost');
+                updateStatusInfo('🔴 Koneksi terputus - mode offline', true);
+            });
+
+            heartbeatInterval = setInterval(() => {
+                if (isFirebaseConnected && isOnline) {
+                    checkFirebaseConnection();
+                }
+            }, 30000);
+        }
+
+        function checkFirebaseConnection() {
+            if (!window.db) return;
+
+            const testRef = window.db.collection('_health').doc('test');
+            testRef.get().then(() => {
+                lastHeartbeat = Date.now();
+                if (!isFirebaseConnected) {
+                    isFirebaseConnected = true;
+                    updateStatusInfo('🟢 Firebase terhubung kembali');
+                    processPendingUpdates();
+                }
+            }).catch(error => {
+                console.warn('❌ Firebase heartbeat failed:', error);
+                if (Date.now() - lastHeartbeat > 60000) {
+                    isFirebaseConnected = false;
+                    updateStatusInfo('🔴 Firebase tidak responsif - mode offline', true);
+                    attemptReconnection();
+                }
+            });
+        }
+
+        function attemptReconnection() {
+            if (connectionRetryCount >= maxRetryAttempts) {
+                console.error('❌ Max retry attempts reached');
+                updateStatusInfo('🔴 Gagal terhubung - mode offline permanent', true);
+                return;
+            }
+
+            const delay = Math.min(1000 * Math.pow(2, connectionRetryCount), 30000);
+            console.log(`🔄 Attempting reconnection in ${delay}ms (attempt ${connectionRetryCount + 1})`);
+            
+            setTimeout(() => {
+                connectionRetryCount++;
+                reconnectFirebase();
+            }, delay);
+        }
+
+        function reconnectFirebase() {
+            if (!isOnline || !window.db) return;
+
+            console.log('🔄 Reconnecting to Firebase...');
+            
+            if (unsubscribe) {
+                unsubscribe();
+                unsubscribe = null;
+            }
+
+            initializeFirebaseListener();
+        }
+
+        // Enhanced Firebase Functions
+        function initializeFirebase() {
+            try {
+                if (!firebase.apps.length) {
+                    firebase.initializeApp(firebaseConfig);
+                }
+                window.db = firebase.firestore();
+                
+                window.db.enablePersistence({ synchronizeTabs: true })
+                    .catch(error => {
+                        console.warn('⚠️ Persistence failed:', error);
+                    });
+
+                return window.db.enableNetwork().then(() => {
+                    isFirebaseConnected = true;
+                    connectionRetryCount = 0;
+                    updateStatusInfo('🟢 Firebase terhubung - Data tersinkron real-time');
+                    initializeFirebaseListener();
+                    loadDynamicData();
+                    setupConnectionMonitoring();
+                }).catch(error => {
+                    console.error('❌ Firebase connection failed:', error);
+                    handleFirebaseError(error);
+                });
+            } catch (error) {
+                console.error('❌ Firebase initialization error:', error);
+                handleFirebaseError(error);
+            }
+        }
+
+        function handleFirebaseError(error) {
+            isFirebaseConnected = false;
+            updateStatusInfo('🔴 Firebase error - Mode offline', true);
+            initializeEmptyData();
+            generateEmployeeCards();
+            populateEmployeeSelector();
+            
+            if (isOnline) {
+                attemptReconnection();
+            }
+        }
+
+        function initializeEmptyData() {
+            checklistData = {};
+            employees.forEach(employee => {
+                checklistData[employee] = {};
+                checklistItems.forEach(item => {
+                    checklistData[employee][item] = false;
+                });
+            });
+        }
+
+        function initializeFirebaseListener() {
+            if (!window.db || !isFirebaseConnected) {
+                console.warn('⚠️ Database not available - using offline mode');
+                initializeEmptyData();
+                generateEmployeeCards();
+                return;
+            }
+
+            const todayKey = getTodayKey();
+            const todayDocRef = window.db.collection("checklist").doc(todayKey);
+
+            showLoading(true);
+            initializeEmptyData();
+
+            unsubscribe = todayDocRef.onSnapshot(
+                {
+                    includeMetadataChanges: true
+                },
+                (doc) => {
+                    if (doc.metadata.fromCache) {
+                        console.log('📦 Data from cache');
+                        updateStatusInfo('📦 Data dari cache - mungkin tidak terbaru');
+                    } else {
+                        console.log('📡 Data from server');
+                        updateStatusInfo('🟢 Data terbaru dari server');
+                    }
+
+                    showLoading(false);
+                    
+                    if (doc.exists) {
+                        const newData = doc.data();
+                        updateChecklistData(newData);
+                    } else {
+                        createInitialDocument(todayDocRef);
+                    }
+                },
+                (error) => {
+                    console.error("❌ Error listening to document:", error);
+                    showLoading(false);
+                    
+                    if (error.code === 'permission-denied') {
+                        showMessage("❌ Akses ditolak - periksa aturan Firebase", true);
+                    } else if (error.code === 'unavailable') {
+                        showMessage("⚠️ Firebase tidak tersedia - mode offline", true);
+                        isFirebaseConnected = false;
+                        attemptReconnection();
+                    } else {
+                        showMessage("⚠️ Koneksi real-time terputus - mencoba reconnect", true);
+                        attemptReconnection();
+                    }
+                    
+                    initializeEmptyData();
+                    generateEmployeeCards();
+                    populateEmployeeSelector();
+                }
+            );
+        }
+
+        function updateChecklistData(newData) {
+            let dataChanged = false;
+            
+            for (const employee in newData) {
+                if (!checklistData[employee]) {
+                    checklistData[employee] = {};
+                }
+                
+                for (const item in newData[employee]) {
+                    if (checklistData[employee][item] !== newData[employee][item]) {
+                        checklistData[employee][item] = newData[employee][item];
+                        dataChanged = true;
+                    }
+                }
+            }
+
+            if (dataChanged) {
+                generateEmployeeCards();
+                populateEmployeeSelector();
+                clearResolvedPendingUpdates();
+            }
+        }
+
+        function createInitialDocument(docRef) {
+            const initialData = {};
+            employees.forEach(employee => {
+                initialData[employee] = {};
+                checklistItems.forEach(item => {
+                    initialData[employee][item] = false;
+                });
+            });
+            
+            docRef.set(initialData).then(() => {
+                console.log('✅ Created new checklist document for today');
+                showMessage('✅ Checklist hari ini siap digunakan');
+            }).catch(error => {
+                console.error("❌ Error creating document:", error);
+                showMessage("⚠️ Gagal membuat dokumen checklist", true);
+            });
+        }
+
+        // Enhanced Update Function with Debouncing and Retry
+        function updateChecklistItem(employee, item, checked) {
+            const updateKey = `${employee}-${item}`;
+            
+            if (updateDebounceTimers.has(updateKey)) {
+                clearTimeout(updateDebounceTimers.get(updateKey));
+            }
+
+            setItemPendingState(employee, item, true);
+            
+            if (!checklistData[employee]) {
+                checklistData[employee] = {};
+            }
+            checklistData[employee][item] = checked;
+
+            const debounceTimer = setTimeout(() => {
+                performFirebaseUpdate(employee, item, checked);
+            }, 500);
+            
+            updateDebounceTimers.set(updateKey, debounceTimer);
+        }
+
+        function performFirebaseUpdate(employee, item, checked) {
+            if (!window.db || !isFirebaseConnected) {
+                pendingUpdates.set(`${employee}-${item}`, { employee, item, checked });
+                setItemPendingState(employee, item, false);
+                showMessage('⚠️ Mode offline - perubahan akan disinkron saat online', true);
+                return;
+            }
+
+            const todayKey = getTodayKey();
+            const todayDocRef = window.db.collection("checklist").doc(todayKey);
+            const updateData = {};
+            updateData[`${employee}.${item}`] = checked;
+
+            todayDocRef.update(updateData).then(() => {
+                console.log(`✅ Updated ${employee} - ${item}: ${checked}`);
+                setItemPendingState(employee, item, false);
+                pendingUpdates.delete(`${employee}-${item}`);
+                showMessage(`✅ ${item} ${checked ? 'dicentang' : 'dibatalkan'} untuk ${employee}`, false);
+            }).catch(error => {
+                console.error("❌ Error updating checklist:", error);
+                
+                pendingUpdates.set(`${employee}-${item}`, { employee, item, checked });
+                setItemPendingState(employee, item, false, true);
+                
+                const checkbox = document.querySelector(`input[data-employee="${employee}"][data-item="${item}"]`);
+                if (checkbox) {
+                    checkbox.checked = !checked;
+                    checklistData[employee][item] = !checked;
+                }
+                
+                showMessage("⚠️ Gagal menyimpan - akan dicoba lagi", true);
+                
+                setTimeout(() => {
+                    performFirebaseUpdate(employee, item, checked);
+                }, 2000);
+            });
+        }
+
+        function setItemPendingState(employee, item, isPending, isError = false) {
+            const checkbox = document.querySelector(`input[data-employee="${employee}"][data-item="${item}"]`);
+            if (!checkbox) return;
+
+            const checklistItem = checkbox.closest('.checklist-item');
+            if (!checklistItem) return;
+
+            checklistItem.classList.toggle('pending', isPending);
+            checklistItem.classList.toggle('error', isError);
+            checkbox.disabled = isPending;
+        }
+
+        function clearResolvedPendingUpdates() {
+            for (const [key, update] of pendingUpdates) {
+                const currentValue = checklistData[update.employee]?.[update.item];
+                if (currentValue === update.checked) {
+                    pendingUpdates.delete(key);
+                    setItemPendingState(update.employee, update.item, false);
+                }
+            }
+        }
+
+        function processPendingUpdates() {
+            if (pendingUpdates.size === 0) return;
+
+            console.log(`🔄 Processing ${pendingUpdates.size} pending updates`);
+            
+            for (const [key, update] of pendingUpdates) {
+                setTimeout(() => {
+                    performFirebaseUpdate(update.employee, update.item, update.checked);
+                }, Math.random() * 2000);
+            }
+        }
+
         // Tab Switching
         function switchTab(tabId) {
             document.querySelectorAll('.nav-tab').forEach(tab => tab.classList.remove('active'));
@@ -887,130 +1250,6 @@
             }
             
             selector.selectedIndex = 0;
-        }
-
-        // Firebase Functions
-        function initializeFirebase() {
-            try {
-                if (!firebase.apps.length) {
-                    firebase.initializeApp(firebaseConfig);
-                }
-                window.db = firebase.firestore();
-                return window.db.enableNetwork().then(() => {
-                    isFirebaseConnected = true;
-                    updateStatusInfo('🟢 Firebase terhubung - Data tersinkron real-time');
-                    initializeFirebaseListener();
-                    loadDynamicData();
-                }).catch(error => {
-                    console.error('❌ Firebase connection failed:', error);
-                    isFirebaseConnected = false;
-                    updateStatusInfo('🔴 Firebase error - Mode offline', true);
-                    initializeEmptyData();
-                    generateEmployeeCards();
-                    populateEmployeeSelector();
-                });
-            } catch (error) {
-                console.error('❌ Firebase initialization error:', error);
-                isFirebaseConnected = false;
-                updateStatusInfo('🔴 Firebase initialization failed - Mode offline', true);
-                initializeEmptyData();
-                generateEmployeeCards();
-                populateEmployeeSelector();
-            }
-        }
-
-        function initializeEmptyData() {
-            checklistData = {};
-            employees.forEach(employee => {
-                checklistData[employee] = {};
-                checklistItems.forEach(item => {
-                    checklistData[employee][item] = false;
-                });
-            });
-        }
-
-        function initializeFirebaseListener() {
-            if (!window.db || !isFirebaseConnected) {
-                showMessage('⚠️ Database tidak tersedia - menggunakan mode offline', true);
-                initializeEmptyData();
-                generateEmployeeCards();
-                return;
-            }
-
-            const todayKey = getTodayKey();
-            const todayDocRef = window.db.collection("checklist").doc(todayKey);
-
-            showLoading(true);
-            initializeEmptyData();
-
-            todayDocRef.get().then(doc => {
-                if (!doc.exists) {
-                    const initialData = {};
-                    employees.forEach(employee => {
-                        initialData[employee] = {};
-                        checklistItems.forEach(item => {
-                            initialData[employee][item] = false;
-                        });
-                    });
-                    return todayDocRef.set(initialData).then(() => {
-                        console.log('✅ Created new checklist document for today');
-                        showMessage('✅ Checklist hari ini siap digunakan');
-                    });
-                }
-            }).catch(error => {
-                console.error("❌ Error creating document:", error);
-                showMessage("⚠️ Gagal membuat dokumen checklist - menggunakan mode offline", true);
-                showLoading(false);
-                generateEmployeeCards();
-            });
-
-            unsubscribe = todayDocRef.onSnapshot(
-                (doc) => {
-                    showLoading(false);
-                    if (doc.exists) {
-                        checklistData = doc.data();
-                        console.log('📡 Real-time data updated');
-                    } else {
-                        initializeEmptyData();
-                    }
-                    generateEmployeeCards();
-                    populateEmployeeSelector();
-                },
-                (error) => {
-                    console.error("❌ Error listening to document:", error);
-                    showMessage("⚠️ Koneksi real-time terputus - data mungkin tidak tersinkron", true);
-                    showLoading(false);
-                    initializeEmptyData();
-                    generateEmployeeCards();
-                    populateEmployeeSelector();
-                }
-            );
-        }
-
-        function updateChecklistItem(employee, item, checked) {
-            if (!window.db || !isFirebaseConnected) {
-                checklistData[employee][item] = checked;
-                generateEmployeeCards();
-                showMessage('⚠️ Mode offline - perubahan tidak akan tersinkron', true);
-                return;
-            }
-
-            const todayKey = getTodayKey();
-            const todayDocRef = window.db.collection("checklist").doc(todayKey);
-
-            const updateData = {};
-            updateData[`${employee}.${item}`] = checked;
-
-            todayDocRef.update(updateData).then(() => {
-                console.log(`✅ Updated ${employee} - ${item}: ${checked}`);
-            }).catch(error => {
-                console.error("❌ Error updating checklist:", error);
-                showMessage("⚠️ Gagal menyimpan perubahan - coba lagi", true);
-                const checkbox = document.querySelector(`input[data-employee="${employee}"][data-item="${item}"]`);
-                if (checkbox) {
-                    checkbox.checked = !checked;
-                }
-            });
         }
 
         // Report Generation
@@ -1806,6 +2045,16 @@
             setupDailyReset();
             populateMonthSelector();
         }
+
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            if (unsubscribe) {
+                unsubscribe();
+            }
+            if (heartbeatInterval) {
+                clearInterval(heartbeatInterval);
+            }
+        });
 
         document.addEventListener('DOMContentLoaded', initializeApp);
     </script>

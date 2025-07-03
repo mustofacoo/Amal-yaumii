@@ -710,15 +710,15 @@
             appId: "1:743065908741:web:5551c8cdb47a3edac58e6c"
         };
 
-        // Application Data
-        let employees = [
+        // DEFAULT DATA - hanya sebagai fallback jika Firebase tidak tersedia
+        const DEFAULT_EMPLOYEES = [
             'Yuni', 'Didik', 'Budi', 'Riris', 'Rico',
             'Syafiq', 'Faruq', 'Maruf', 'Mamduh', 'Rendi',
             'Hammam', 'Sukris', 'Ibad', 'Faisal', 'Naim',
             'Abdullah', 'Pegawai'
         ];
 
-        let checklistItems = [
+        const DEFAULT_TASKS = [
             'Qiyamul Lail',
             'Shubuh Berjamaah',
             'Sedekah (utamakan shubuh)',
@@ -728,6 +728,10 @@
             'Istighfar & sholawat'
         ];
 
+        // SINGLE SOURCE OF TRUTH - semua fungsi akan menggunakan ini
+        let employees = [];
+        let checklistItems = [];
+
         // Global variables
         let checklistData = {};
         let unsubscribe = null;
@@ -736,8 +740,6 @@
         let maxRetryAttempts = 5;
         let isOnline = navigator.onLine;
         let currentUser = null;
-        let adminEmployees = [...employees];
-        let adminTasks = [...checklistItems];
         let editingEmployee = null;
         let editingTask = null;
         let lastResetCheck = null;
@@ -748,6 +750,9 @@
         let connectionMonitor = null;
         let lastHeartbeat = Date.now();
         let heartbeatInterval = null;
+
+        // Data loading state
+        let isDataLoaded = false;
 
         // Utility Functions
         function getTodayKey() {
@@ -850,6 +855,112 @@
             }
         }
 
+        // UNIFIED DATA MANAGEMENT - satu fungsi untuk semua data
+        function initializeDataStructure() {
+            checklistData = {};
+            employees.forEach(employee => {
+                checklistData[employee] = {};
+                checklistItems.forEach(item => {
+                    checklistData[employee][item] = false;
+                });
+            });
+        }
+
+        function updateAllUI() {
+            generateEmployeeCards();
+            populateEmployeeSelector();
+            if (currentUser) {
+                updateAdminUI();
+            }
+        }
+
+        // MASTER DATA LOADER - load semua data dari Firebase
+        async function loadMasterData() {
+            updateStatusInfo('🔄 Memuat data pegawai dan tugas...');
+            
+            try {
+                let employeesLoaded = false;
+                let tasksLoaded = false;
+
+                // Load employees
+                try {
+                    const employeesDoc = await window.db.collection('config').doc('employees').get();
+                    if (employeesDoc.exists && employeesDoc.data().list) {
+                        employees = [...employeesDoc.data().list];
+                        employeesLoaded = true;
+                        console.log('✅ Employees loaded from Firebase:', employees.length);
+                    }
+                } catch (error) {
+                    console.warn('⚠️ Error loading employees:', error);
+                }
+
+                // Load tasks
+                try {
+                    const tasksDoc = await window.db.collection('config').doc('tasks').get();
+                    if (tasksDoc.exists && tasksDoc.data().list) {
+                        checklistItems = [...tasksDoc.data().list];
+                        tasksLoaded = true;
+                        console.log('✅ Tasks loaded from Firebase:', checklistItems.length);
+                    }
+                } catch (error) {
+                    console.warn('⚠️ Error loading tasks:', error);
+                }
+
+                // Fallback to defaults if Firebase data not available
+                if (!employeesLoaded) {
+                    employees = [...DEFAULT_EMPLOYEES];
+                    console.log('📦 Using default employees');
+                }
+
+                if (!tasksLoaded) {
+                    checklistItems = [...DEFAULT_TASKS];
+                    console.log('📦 Using default tasks');
+                }
+
+                // Create default config documents if they don't exist
+                if (!employeesLoaded && isFirebaseConnected) {
+                    try {
+                        await window.db.collection('config').doc('employees').set({
+                            list: employees,
+                            createdAt: firebase.firestore.FieldValue.serverTimestamp()
+                        });
+                        console.log('✅ Created default employees config');
+                    } catch (error) {
+                        console.warn('⚠️ Error creating employees config:', error);
+                    }
+                }
+
+                if (!tasksLoaded && isFirebaseConnected) {
+                    try {
+                        await window.db.collection('config').doc('tasks').set({
+                            list: checklistItems,
+                            createdAt: firebase.firestore.FieldValue.serverTimestamp()
+                        });
+                        console.log('✅ Created default tasks config');
+                    } catch (error) {
+                        console.warn('⚠️ Error creating tasks config:', error);
+                    }
+                }
+
+                isDataLoaded = true;
+                initializeDataStructure();
+                updateAllUI();
+                updateStatusInfo('✅ Data pegawai dan tugas berhasil dimuat');
+                showMessage('✅ Data pegawai dan tugas berhasil dimuat');
+
+            } catch (error) {
+                console.error('❌ Error loading master data:', error);
+                // Fallback to defaults
+                employees = [...DEFAULT_EMPLOYEES];
+                checklistItems = [...DEFAULT_TASKS];
+                isDataLoaded = true;
+                initializeDataStructure();
+                updateAllUI();
+                updateStatusInfo('⚠️ Menggunakan data default', true);
+                showMessage('⚠️ Menggunakan data default - beberapa fungsi mungkin terbatas', true);
+            }
+        }
+
         // Enhanced Connection Monitoring
         function setupConnectionMonitoring() {
             window.addEventListener('online', () => {
@@ -939,9 +1050,13 @@
                     isFirebaseConnected = true;
                     connectionRetryCount = 0;
                     updateStatusInfo('🟢 Firebase terhubung - Data tersinkron real-time');
-                    initializeFirebaseListener();
-                    loadDynamicData();
-                    setupConnectionMonitoring();
+                    
+                    // Load master data first, then initialize listener
+                    return loadMasterData().then(() => {
+                        initializeFirebaseListener();
+                        setupConnectionMonitoring();
+                    });
+                    
                 }).catch(error => {
                     console.error('❌ Firebase connection failed:', error);
                     handleFirebaseError(error);
@@ -955,30 +1070,22 @@
         function handleFirebaseError(error) {
             isFirebaseConnected = false;
             updateStatusInfo('🔴 Firebase error - Mode offline', true);
-            initializeEmptyData();
-            generateEmployeeCards();
-            populateEmployeeSelector();
+            
+            // Load default data
+            employees = [...DEFAULT_EMPLOYEES];
+            checklistItems = [...DEFAULT_TASKS];
+            isDataLoaded = true;
+            initializeDataStructure();
+            updateAllUI();
             
             if (isOnline) {
                 attemptReconnection();
             }
         }
 
-        function initializeEmptyData() {
-            checklistData = {};
-            employees.forEach(employee => {
-                checklistData[employee] = {};
-                checklistItems.forEach(item => {
-                    checklistData[employee][item] = false;
-                });
-            });
-        }
-
         function initializeFirebaseListener() {
-            if (!window.db || !isFirebaseConnected) {
-                console.warn('⚠️ Database not available - using offline mode');
-                initializeEmptyData();
-                generateEmployeeCards();
+            if (!window.db || !isFirebaseConnected || !isDataLoaded) {
+                console.warn('⚠️ Database not ready for listener');
                 return;
             }
 
@@ -986,8 +1093,8 @@
             const todayDocRef = window.db.collection("checklist").doc(todayKey);
 
             showLoading(true);
-            initializeEmptyData();
-
+            // Don't reset data structure here - preserve loaded structure
+            
             unsubscribe = todayDocRef.onSnapshot(
                 {
                     includeMetadataChanges: true
@@ -1024,10 +1131,6 @@
                         showMessage("⚠️ Koneksi real-time terputus - mencoba reconnect", true);
                         attemptReconnection();
                     }
-                    
-                    initializeEmptyData();
-                    generateEmployeeCards();
-                    populateEmployeeSelector();
                 }
             );
         }
@@ -1035,22 +1138,25 @@
         function updateChecklistData(newData) {
             let dataChanged = false;
             
-            for (const employee in newData) {
+            // Only update existing employees and tasks
+            for (const employee of employees) {
                 if (!checklistData[employee]) {
                     checklistData[employee] = {};
                 }
                 
-                for (const item in newData[employee]) {
-                    if (checklistData[employee][item] !== newData[employee][item]) {
-                        checklistData[employee][item] = newData[employee][item];
-                        dataChanged = true;
+                if (newData[employee]) {
+                    for (const item of checklistItems) {
+                        const newValue = newData[employee][item] || false;
+                        if (checklistData[employee][item] !== newValue) {
+                            checklistData[employee][item] = newValue;
+                            dataChanged = true;
+                        }
                     }
                 }
             }
 
             if (dataChanged) {
                 generateEmployeeCards();
-                populateEmployeeSelector();
                 clearResolvedPendingUpdates();
             }
         }
@@ -1208,7 +1314,7 @@
             if (!selector) return;
             
             selector.innerHTML = '<option value="">-- Pilih Pegawai --</option>';
-            employees.sort((a, b) => a.localeCompare(b, 'id')).forEach(employee => {
+            [...employees].sort((a, b) => a.localeCompare(b, 'id')).forEach(employee => {
                 const option = document.createElement('option');
                 option.value = employee;
                 option.textContent = employee;
@@ -1368,7 +1474,7 @@
                 document.getElementById('reportTab').style.display = 'block';
                 document.getElementById('loginTab').style.display = 'none';
 
-                loadAdminData();
+                updateAdminUI();
                 switchTab('admin');
                 showMessage('✅ Login berhasil! Selamat datang Admin');
             } catch (error) {
@@ -1406,75 +1512,15 @@
             });
         }
 
-        // Admin Data Management
-        async function loadAdminData() {
-            try {
-                const employeesDoc = await window.db.collection('config').doc('employees').get();
-                if (employeesDoc.exists) {
-                    adminEmployees = employeesDoc.data().list || [...employees];
-                } else {
-                    adminEmployees = [...employees];
-                }
-
-                const tasksDoc = await window.db.collection('config').doc('tasks').get();
-                if (tasksDoc.exists) {
-                    adminTasks = tasksDoc.data().list || [...checklistItems];
-                } else {
-                    adminTasks = [...checklistItems];
-                }
-
-                employees = [...adminEmployees];
-                checklistItems = [...adminTasks];
-                initializeEmptyData();
-                generateEmployeeCards();
-                populateEmployeeSelector();
-                updateAdminUI();
-            } catch (error) {
-                console.error('Error loading admin data:', error);
-                adminEmployees = [...employees];
-                adminTasks = [...checklistItems];
-                updateAdminUI();
-                showMessage('⚠️ Menggunakan data default - Firebase tidak tersedia', true);
-            }
-        }
-
-        async function loadDynamicData() {
-            try {
-                const employeesDoc = await window.db.collection('config').doc('employees').get();
-                if (employeesDoc.exists) {
-                    const dynamicEmployees = employeesDoc.data().list;
-                    if (dynamicEmployees && dynamicEmployees.length > 0) {
-                        employees.length = 0;
-                        employees.push(...dynamicEmployees);
-                    }
-                }
-
-                const tasksDoc = await window.db.collection('config').doc('tasks').get();
-                if (tasksDoc.exists) {
-                    const dynamicTasks = tasksDoc.data().list;
-                    if (dynamicTasks && dynamicTasks.length > 0) {
-                        checklistItems.length = 0;
-                        checklistItems.push(...dynamicTasks);
-                    }
-                }
-
-                initializeEmptyData();
-                generateEmployeeCards();
-                populateEmployeeSelector();
-            } catch (error) {
-                console.error('Error loading dynamic data:', error);
-                showMessage('⚠️ Gagal memuat konfigurasi - menggunakan data default', true);
-            }
-        }
-
+        // UNIFIED SAVE FUNCTIONS
         async function saveEmployeesToFirebase() {
             try {
                 if (!window.db || !isFirebaseConnected) {
-                    console.log('⚠️ Firebase not available, saving locally only');
+                    console.log('⚠️ Firebase not available, changes will sync when online');
                     return true;
                 }
                 await window.db.collection('config').doc('employees').set({
-                    list: adminEmployees,
+                    list: employees,
                     updatedAt: firebase.firestore.FieldValue.serverTimestamp()
                 });
                 console.log('✅ Employees saved to Firebase');
@@ -1489,11 +1535,11 @@
         async function saveTasksToFirebase() {
             try {
                 if (!window.db || !isFirebaseConnected) {
-                    console.log('⚠️ Firebase not available, saving locally only');
+                    console.log('⚠️ Firebase not available, changes will sync when online');
                     return true;
                 }
                 await window.db.collection('config').doc('tasks').set({
-                    list: adminTasks,
+                    list: checklistItems,
                     updatedAt: firebase.firestore.FieldValue.serverTimestamp()
                 });
                 console.log('✅ Tasks saved to Firebase');
@@ -1515,23 +1561,24 @@
                 return;
             }
             
-            if (adminEmployees.includes(name)) {
+            if (employees.includes(name)) {
                 showMessage('⚠️ Pegawai sudah ada dalam daftar', true);
                 return;
             }
             
-            adminEmployees.push(name);
-            updateAdminUI();
-            saveEmployeesToFirebase();
+            // Add to main employees array
+            employees.push(name);
+            
+            // Update data structure
+            initializeDataStructure();
+            
+            // Update UI
+            updateAllUI();
+            
+            // Save to Firebase
+            await saveEmployeesToFirebase();
+            
             input.value = '';
-            
-            if (!employees.includes(name)) {
-                employees.push(name);
-                initializeEmptyData();
-                generateEmployeeCards();
-                populateEmployeeSelector();
-            }
-            
             showMessage(`✅ Pegawai "${name}" berhasil ditambahkan`);
         }
 
@@ -1570,25 +1617,24 @@
                 return;
             }
             
-            if (adminEmployees.includes(newName)) {
+            if (employees.includes(newName)) {
                 showMessage('⚠️ Nama pegawai sudah ada dalam daftar', true);
                 return;
             }
             
-            const index = adminEmployees.indexOf(oldName);
+            const index = employees.indexOf(oldName);
             if (index > -1) {
-                adminEmployees[index] = newName;
+                employees[index] = newName;
                 editingEmployee = null;
-                updateAdminUI();
-                saveEmployeesToFirebase();
                 
-                const mainIndex = employees.indexOf(oldName);
-                if (mainIndex > -1) {
-                    employees[mainIndex] = newName;
-                    initializeEmptyData();
-                    generateEmployeeCards();
-                    populateEmployeeSelector();
-                }
+                // Update data structure
+                initializeDataStructure();
+                
+                // Update UI
+                updateAllUI();
+                
+                // Save to Firebase
+                await saveEmployeesToFirebase();
                 
                 showMessage(`✅ Nama pegawai berhasil diubah dari "${oldName}" ke "${newName}"`);
             }
@@ -1601,20 +1647,22 @@
 
         async function removeEmployee(name) {
             if (confirm(`⚠️ Yakin ingin menghapus pegawai "${name}"?\n\nSemua data checklist pegawai ini akan hilang!`)) {
-                adminEmployees = adminEmployees.filter(emp => emp !== name);
-                editingEmployee = null;
-                updateAdminUI();
-                saveEmployeesToFirebase();
-                
                 const index = employees.indexOf(name);
                 if (index > -1) {
                     employees.splice(index, 1);
-                    initializeEmptyData();
-                    generateEmployeeCards();
-                    populateEmployeeSelector();
+                    editingEmployee = null;
+                    
+                    // Update data structure
+                    initializeDataStructure();
+                    
+                    // Update UI
+                    updateAllUI();
+                    
+                    // Save to Firebase
+                    await saveEmployeesToFirebase();
+                    
+                    showMessage(`🗑️ Pegawai "${name}" berhasil dihapus`);
                 }
-                
-                showMessage(`🗑️ Pegawai "${name}" berhasil dihapus`);
             }
         }
 
@@ -1628,22 +1676,24 @@
                 return;
             }
             
-            if (adminTasks.includes(task)) {
+            if (checklistItems.includes(task)) {
                 showMessage('⚠️ Tugas sudah ada dalam daftar', true);
                 return;
             }
             
-            adminTasks.push(task);
-            updateAdminUI();
-            saveTasksToFirebase();
+            // Add to main tasks array
+            checklistItems.push(task);
+            
+            // Update data structure
+            initializeDataStructure();
+            
+            // Update UI
+            updateAllUI();
+            
+            // Save to Firebase
+            await saveTasksToFirebase();
+            
             input.value = '';
-            
-            if (!checklistItems.includes(task)) {
-                checklistItems.push(task);
-                initializeEmptyData();
-                generateEmployeeCards();
-            }
-            
             showMessage(`✅ Tugas "${task}" berhasil ditambahkan`);
         }
 
@@ -1682,24 +1732,24 @@
                 return;
             }
             
-            if (adminTasks.includes(newTask)) {
+            if (checklistItems.includes(newTask)) {
                 showMessage('⚠️ Nama tugas sudah ada dalam daftar', true);
                 return;
             }
             
-            const index = adminTasks.indexOf(oldTask);
+            const index = checklistItems.indexOf(oldTask);
             if (index > -1) {
-                adminTasks[index] = newTask;
+                checklistItems[index] = newTask;
                 editingTask = null;
-                updateAdminUI();
-                saveTasksToFirebase();
                 
-                const mainIndex = checklistItems.indexOf(oldTask);
-                if (mainIndex > -1) {
-                    checklistItems[mainIndex] = newTask;
-                    initializeEmptyData();
-                    generateEmployeeCards();
-                }
+                // Update data structure
+                initializeDataStructure();
+                
+                // Update UI
+                updateAllUI();
+                
+                // Save to Firebase
+                await saveTasksToFirebase();
                 
                 showMessage(`✅ Nama tugas berhasil diubah dari "${oldTask}" ke "${newTask}"`);
             }
@@ -1712,19 +1762,22 @@
 
         async function removeTask(task) {
             if (confirm(`⚠️ Yakin ingin menghapus tugas "${task}"?\n\nSemua data checklist untuk tugas ini akan hilang!`)) {
-                adminTasks = adminTasks.filter(t => t !== task);
-                editingTask = null;
-                updateAdminUI();
-                saveTasksToFirebase();
-                
                 const index = checklistItems.indexOf(task);
                 if (index > -1) {
                     checklistItems.splice(index, 1);
-                    initializeEmptyData();
-                    generateEmployeeCards();
+                    editingTask = null;
+                    
+                    // Update data structure
+                    initializeDataStructure();
+                    
+                    // Update UI
+                    updateAllUI();
+                    
+                    // Save to Firebase
+                    await saveTasksToFirebase();
+                    
+                    showMessage(`🗑️ Tugas "${task}" berhasil dihapus`);
                 }
-                
-                showMessage(`🗑️ Tugas "${task}" berhasil dihapus`);
             }
         }
 
@@ -1738,12 +1791,12 @@
             const container = document.getElementById('employeeList');
             if (!container) return;
             
-            if (adminEmployees.length === 0) {
+            if (employees.length === 0) {
                 container.innerHTML = '<p style="text-align: center; color: #6c757d; padding: 20px;">Belum ada pegawai</p>';
                 return;
             }
             
-            container.innerHTML = adminEmployees.map(employee => {
+            container.innerHTML = employees.map(employee => {
                 if (editingEmployee === employee) {
                     return `
                         <div class="list-item">
@@ -1777,12 +1830,12 @@
             const container = document.getElementById('taskList');
             if (!container) return;
             
-            if (adminTasks.length === 0) {
+            if (checklistItems.length === 0) {
                 container.innerHTML = '<p style="text-align: center; color: #6c757d; padding: 20px;">Belum ada tugas</p>';
                 return;
             }
             
-            container.innerHTML = adminTasks.map(task => {
+            container.innerHTML = checklistItems.map(task => {
                 if (editingTask === task) {
                     return `
                         <div class="list-item">
@@ -1845,10 +1898,10 @@
             if (unsubscribe) {
                 unsubscribe();
             }
-            if (isFirebaseConnected) {
+            if (isFirebaseConnected && isDataLoaded) {
                 initializeFirebaseListener();
             } else {
-                initializeEmptyData();
+                initializeDataStructure();
                 generateEmployeeCards();
             }
         }
@@ -1858,7 +1911,11 @@
             const grid = document.getElementById('employeeGrid');
             if (!grid) {
                 console.error('Employee grid element not found');
-                showMessage('⚠️ Gagal menampilkan daftar checklist', true);
+                return;
+            }
+
+            if (employees.length === 0) {
+                grid.innerHTML = '<div style="text-align: center; padding: 40px; color: #6c757d;">Belum ada pegawai yang terdaftar</div>';
                 return;
             }
 
@@ -2020,6 +2077,7 @@
                         <li><strong>Mengedit Tugas:</strong> Klik tombol "Edit" di samping nama tugas, ubah nama, lalu klik "Simpan"</li>
                         <li><strong>Menghapus Tugas:</strong> Klik tombol "Hapus" di samping nama tugas</li>
                         <li><strong>⚠️ Peringatan:</strong> Menghapus pegawai atau tugas akan menghilangkan semua data checklist terkait</li>
+                        <li><strong>📊 Sinkronisasi:</strong> Perubahan akan langsung terlihat di halaman Checklist Harian</li>
                     </ul>
                 </div>
             `;
@@ -2041,7 +2099,6 @@
             initializeUI();
             initializeFirebase();
             switchTab('checklist');
-            populateEmployeeSelector();
             setupDailyReset();
             populateMonthSelector();
         }
